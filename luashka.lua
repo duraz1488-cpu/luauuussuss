@@ -6,11 +6,90 @@ local GuiService = game:GetService("GuiService")
 local HttpService = game:GetService("HttpService")
 local localPlayer = Players.LocalPlayer
 
+-- ══════════════════════════════════════════════════════
+--  CONFIG SAVE / LOAD  (writefile/readfile, per PlaceId)
+-- ══════════════════════════════════════════════════════
+local CONFIG_FOLDER = "AntiloseCfg"
+local CONFIG_FILE   = CONFIG_FOLDER .. "/" .. tostring(game.PlaceId) .. ".json"
+
+local function cfgWriteAvailable()
+	return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function cfgEnsureFolder()
+	if type(isfolder) == "function" and not isfolder(CONFIG_FOLDER) then
+		if type(makefolder) == "function" then
+			pcall(makefolder, CONFIG_FOLDER)
+		end
+	end
+end
+
+-- Цвет → {r,g,b} для JSON
+local function colorToTbl(c)
+	return { r = math.floor(c.R * 255 + 0.5), g = math.floor(c.G * 255 + 0.5), b = math.floor(c.B * 255 + 0.5) }
+end
+local function tblToColor(t)
+	if type(t) ~= "table" then return nil end
+	return Color3.fromRGB(t.r or 255, t.g or 255, t.b or 255)
+end
+
+-- EnumItem → строка
+local function enumToStr(e)
+	return tostring(e)
+end
+local function strToAimKey(s)
+	-- "Enum.UserInputType.MouseButton2" или "Enum.KeyCode.E"
+	local uit = s:match("UserInputType%.(.+)")
+	if uit then
+		local ok, v = pcall(function() return Enum.UserInputType[uit] end)
+		if ok and v then return v end
+	end
+	local kc = s:match("KeyCode%.(.+)")
+	if kc then
+		local ok, v = pcall(function() return Enum.KeyCode[kc] end)
+		if ok and v then return v end
+	end
+	return Enum.UserInputType.MouseButton2
+end
+
+-- Глобальные ссылки на состояния которые нужно сохранять
+-- (заполняются после createGui, используются save/load)
+local SAVE_STATE = {}  -- заполняется в createGui через registerSave()
+
+local function saveConfig()
+	if not cfgWriteAvailable() then return false end
+	cfgEnsureFolder()
+	local ok, err = pcall(function()
+		local t = {}
+		for k, getter in pairs(SAVE_STATE) do
+			pcall(function() t[k] = getter() end)
+		end
+		writefile(CONFIG_FILE, HttpService:JSONEncode(t))
+	end)
+	return ok
+end
+
+local function loadConfig()
+	if not cfgWriteAvailable() then return false end
+	if type(isfile) == "function" and not isfile(CONFIG_FILE) then return false end
+	local ok, err = pcall(function()
+		local raw = readfile(CONFIG_FILE)
+		local t = HttpService:JSONDecode(raw)
+		for k, setter in pairs(SAVE_STATE) do
+			if t[k] ~= nil then
+				pcall(setter, t[k])
+			end
+		end
+	end)
+	return ok
+end
+
 local TOGGLE_KEY = Enum.KeyCode.Delete
 local isOpen = false
 local screenGui = nil
 local conns = {}
 local isUnloaded = false
+local _globalStopSprint = nil  -- заполняется в createGui() для вызова из unload()
 
 -- ══════════════════════════════════════════════════════
 --  AIMBOT SYSTEM  (pasta.txt aimlock 1:1 + tool raycast)
@@ -372,11 +451,14 @@ local function startAimbotLoop()
 end
 
 -- Input: держим AimKey — HoldingAim = true
-RunService.Heartbeat:Connect(function()
+-- (хранится в conns через track чтобы отключился при unload)
+local _aimHoldConn = RunService.Heartbeat:Connect(function()
+	if isUnloaded then return end
 	if AB.AimKey.EnumType == Enum.UserInputType then
 		HoldingAim = AB.enabled and UserInputService:IsMouseButtonPressed(AB.AimKey)
 	end
 end)
+table.insert(conns, _aimHoldConn)
 
 startAimbotLoop()
 
@@ -403,45 +485,52 @@ local function simulateLMB()
 end
 
 -- сохраняем позицию камеры в момент нажатия AimKey (до любого аима)
-RunService.Heartbeat:Connect(function()
+local _backCamConn = RunService.Heartbeat:Connect(function()
+	if isUnloaded then return end
 	local holding = AB.enabled and HoldingAim
 	if holding and not wasHoldingAim then
-		-- edge: только что нажали
 		if AB.BackCamera then
 			preShotCameraRef = Camera.CFrame
 		end
 	end
 	if not holding and wasHoldingAim then
-		-- edge: отпустили — сбрасываем
 		preShotCameraRef = nil
 		autoFireCooldown = false
 	end
 	wasHoldingAim = holding
 end)
+table.insert(conns, _backCamConn)
 
-RunService.RenderStepped:Connect(function()
-	if not AB.enabled or not AB.AutoFire or not HoldingAim then return end
+local _autoFireConn = RunService.RenderStepped:Connect(function()
+	if isUnloaded then return end
+	if not AB.enabled or not AB.AutoFire then return end
+	if not HoldingAim then return end   -- стрелять только пока зажат бинд прицела
 	if autoFireCooldown then return end
-	if not CurrentTarget then return end
+	local target = CurrentTarget
+	if not target then
+		target = GetClosestPlayer()
+	end
+	if not target then return end
 
-	local char = CurrentTarget.Player and CurrentTarget.Player.Character
+	local char = target.Player and target.Player.Character
 	if not char or not IsAlive(char) then return end
 	local part = getAimPart(char)
 	if not part then return end
 	local aimPos = getAimPosition(part)
 
-	-- стреляем сразу как только есть цель и она видна
 	if not IsVisibleHard(char, aimPos) then return end
 
 	autoFireCooldown = true
 	simulateLMB()
 
 	task.delay(AB.BackCameraDelay / 1000, function()
+		if isUnloaded then return end
 		if AB.BackCamera and preShotCameraRef then
 			local origin = preShotCameraRef
 			local t = 0
 			local conn
 			conn = RunService.RenderStepped:Connect(function(dt)
+				if isUnloaded then conn:Disconnect(); return end
 				t = t + dt * 12
 				Camera.CFrame = Camera.CFrame:Lerp(origin, math.min(t, 1))
 				if t >= 1 then
@@ -451,14 +540,19 @@ RunService.RenderStepped:Connect(function()
 			end)
 		end
 		task.wait(0.1)
-		autoFireCooldown = false
+		if not isUnloaded then
+			autoFireCooldown = false
+		end
 	end)
 end)
+table.insert(conns, _autoFireConn)
 
 -- FOV circle update loop
-RunService.RenderStepped:Connect(function()
+local _fovCircleConn = RunService.RenderStepped:Connect(function()
+	if isUnloaded then return end
 	pcall(updateFovCircle)
 end)
+table.insert(conns, _fovCircleConn)
 
 -- Highlight state
 local highlightEnabled = false
@@ -588,12 +682,47 @@ end
 local function unload()
 	if isUnloaded then return end
 	isUnloaded = true
+
+	-- ── 1. Остановить aimbot ──────────────────────────────────────────────────
+	AB.enabled  = false
+	HoldingAim  = false
+	CurrentTarget = nil
+	if aimbotConn then
+		pcall(function() aimbotConn:Disconnect() end)
+		aimbotConn = nil
+	end
+
+	-- ── 2. Остановить YAW rotator и вернуть AutoRotate ───────────────────────
+	pcall(function() RunService:UnbindFromRenderStep("_AntiLoseYawRotator") end)
+	pcall(function()
+		local char = localPlayer.Character
+		local hum  = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.AutoRotate = true end
+	end)
+
+	-- ── 3. Остановить Sprint (отпустить Shift) ───────────────────────────────
+	if _globalStopSprint then pcall(_globalStopSprint) end
+	pcall(function() RunService:UnbindFromRenderStep("FovChanger") end)
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		if cam then cam.FieldOfView = 70 end
+	end)
+	fovEnabled = false
+
+	-- ── 4. Убрать highlights ──────────────────────────────────────────────────
 	clearAllHighlights()
+	highlightEnabled = false
+
+	-- ── 5. Убрать FOV circle ─────────────────────────────────────────────────
 	destroyFovCircle()
+
+	-- ── 6. Отключить все трекнутые коннекшны ─────────────────────────────────
 	for _, c in ipairs(conns) do
 		pcall(function() c:Disconnect() end)
 	end
 	conns = {}
+
+	-- ── 7. Уничтожить GUI ────────────────────────────────────────────────────
 	if screenGui then
 		pcall(function() screenGui:Destroy() end)
 		screenGui = nil
@@ -1917,50 +2046,6 @@ local function createGui()
 	end
 	createHsSound()
 
-	-- ── Killsound system ──
-	local ksEnabled   = false
-	local ksVolume    = 100
-	local ksCustomId  = "5159073368"
-	local ksPresets   = {
-		{ name = "nya",       id = "128315748935399" },
-		{ name = "neverlose", id = "139452805868562" },
-		{ name = "chomp",     id = "91209592691035"  },
-		{ name = "bell",      id = "124010691633262" },
-		{ name = "osu",       id = "123941247147792" },
-		{ name = "custom",    id = nil               },
-	}
-	local ksPresetIdx = 1
-	local ksSound     = nil
-
-	local function getKsCurrentId()
-		local p = ksPresets[ksPresetIdx]
-		if p.name == "custom" then return ksCustomId end
-		return p.id
-	end
-
-	local function createKsSound()
-		if ksSound then pcall(function() ksSound:Destroy() end) end
-		ksSound = Instance.new("Sound")
-		ksSound.SoundId = "rbxassetid://" .. getKsCurrentId()
-		ksSound.Volume  = ksVolume / 100
-		ksSound.RollOffMaxDistance = 0
-		ksSound.Parent  = game:GetService("SoundService")
-	end
-	createKsSound()
-
-	local function playKillsound()
-		if not ksEnabled or not ksSound then return end
-		pcall(function()
-			local clone = ksSound:Clone()
-			clone.Parent = game:GetService("SoundService")
-			clone:Play()
-			clone.Ended:Connect(function() pcall(function() clone:Destroy() end) end)
-		end)
-	end
-
-	-- pending kill tracking: если чел умер — следующий Red хитмаркер это убийство
-	local pendingKillPlayers = {}  -- plr -> true
-
 	local function playHitsound()
 		if not hsEnabled or not hsSound then return end
 		pcall(function()
@@ -1974,62 +2059,9 @@ local function createGui()
 	local hitMarkerRE = game:GetService("ReplicatedStorage"):FindFirstChild("HitMarkerEvento")
 	if hitMarkerRE then
 		track(hitMarkerRE.OnClientEvent:Connect(function(arg1)
-			-- "Red" = убийство, всё остальное = обычное попадание
-			local isKillHit = (arg1 == "Red")
-			if isKillHit then
-				-- проверяем есть ли pending kill
-				local isKill = false
-				for plr, _ in pairs(pendingKillPlayers) do
-					isKill = true
-					pendingKillPlayers[plr] = nil
-					break
-				end
-				if isKill and ksEnabled then
-					playKillsound()
-					-- хитсаунд на убийство не играем если killsound включён
-				else
-					playHitsound()
-				end
-			else
-				-- обычное попадание — всегда hitsound
-				playHitsound()
-			end
+			playHitsound()
 		end))
 	end
-
-	-- перехватываем dead event для killsound
-	local _origWatchPlayerDeath = watchPlayerDeath
-	local function patchKillsoundDeath(plr)
-		local char = plr.Character
-		if not char then return end
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		if not hum then return end
-		local diedEvent = hum:FindFirstChild("Died")
-		if diedEvent and diedEvent:IsA("RemoteEvent") then
-			track(diedEvent.OnClientEvent:Connect(function()
-				pendingKillPlayers[plr] = true
-				-- сбрасываем через секунду на случай если хитмаркер не пришёл
-				task.delay(1, function() pendingKillPlayers[plr] = nil end)
-			end))
-		end
-	end
-
-	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr ~= localPlayer then
-			patchKillsoundDeath(plr)
-			plr.CharacterAdded:Connect(function()
-				task.wait(0.1)
-				patchKillsoundDeath(plr)
-			end)
-		end
-	end
-	Players.PlayerAdded:Connect(function(plr)
-		if plr == localPlayer then return end
-		plr.CharacterAdded:Connect(function()
-			task.wait(0.1)
-			patchKillsoundDeath(plr)
-		end)
-	end)
 
 	-- ══ helper: создать строку комбобокса ══
 	local function makeSoundComboRow(parent, presets, getIdx, setIdx, onCreate, lo)
@@ -2287,54 +2319,996 @@ local function createGui()
 	end
 
 	-- ══════════════════════════════════════════════
-	-- KILLSOUND секция (LayoutOrder 20-29)
+	-- THIRD PERSON секция (LayoutOrder 30-39)
 	-- ══════════════════════════════════════════════
+	tpEnabled  = false
+	tpDistance = 12
 	do
-		local div = addSectionDivider(miscContent, "KILLSOUND")
-		div.LayoutOrder = 20
+		local Camera3 = workspace.CurrentCamera
+		local tpConn  = nil
 
-		local tog = addToggle(miscContent, "Killsound", false, function(v) ksEnabled = v end)
-		tog.LayoutOrder = 21
+		local function applyThirdPerson()
+			if not tpEnabled then
+				if tpConn then tpConn:Disconnect(); tpConn = nil end
+				-- вернуть стандартное расстояние камеры
+				local playerModule = require(Players.LocalPlayer.PlayerScripts:WaitForChild("PlayerModule"))
+				pcall(function()
+					local controls = playerModule:GetControls()
+				end)
+				-- просто сбрасываем через CameraMode
+				pcall(function()
+					Players.LocalPlayer.CameraMode = Enum.CameraMode.Classic
+				end)
+				return
+			end
+			if tpConn then tpConn:Disconnect(); tpConn = nil end
+			tpConn = RunService.RenderStepped:Connect(function()
+				if not tpEnabled then return end
+				local char = Players.LocalPlayer.Character
+				if not char then return end
+				local hrp = char:FindFirstChild("HumanoidRootPart")
+				if not hrp then return end
+				local cf = Camera3.CFrame
+				local dir = (cf.Position - hrp.Position)
+				if dir.Magnitude < 0.01 then return end
+				local newPos = hrp.Position + dir.Unit * tpDistance
+				Camera3.CFrame = CFrame.new(newPos, hrp.Position + Vector3.new(0, 1.5, 0))
+			end)
+		end
 
-		local ksComboBtn = makeSoundComboRow(
-			miscContent,
-			ksPresets,
-			function() return ksPresetIdx end,
-			function(i) ksPresetIdx = i end,
-			createKsSound,
-			22
-		)
+		local div3 = addSectionDivider(miscContent, "THIRD PERSON")
+		div3.LayoutOrder = 30
 
-		local refreshKsId = makeSoundIdRow(
-			miscContent,
-			function() return ksCustomId end,
-			function(v) ksCustomId = v end,
-			function() return ksPresets end,
-			function() return ksPresetIdx end,
-			createKsSound,
-			23
-		)
+		local tpToggle = addToggle(miscContent, "Third Person Distance", false, function(v)
+			tpEnabled = v
+			applyThirdPerson()
+		end)
+		tpToggle.LayoutOrder = 31
 
-		makeVolSlider(
-			miscContent,
-			function() return ksVolume end,
-			function(v) ksVolume = v end,
-			function() return ksSound end,
-			24
-		)
+		-- Слайдер дальности (большой, от 4 до 60)
+		local tpSliderCont = Instance.new("Frame")
+		tpSliderCont.Size = UDim2.new(1, 0, 0, 48)
+		tpSliderCont.BackgroundTransparency = 1
+		tpSliderCont.LayoutOrder = 32
+		tpSliderCont.ZIndex = miscContent.ZIndex + 1
+		tpSliderCont.Parent = miscContent
 
-		addSectionEndLine(miscContent, 25)
+		local tpLbl = Instance.new("TextLabel")
+		tpLbl.Size = UDim2.new(1, -16, 0, 16); tpLbl.Position = UDim2.fromOffset(16, 2)
+		tpLbl.BackgroundTransparency = 1; tpLbl.Text = "Distance: " .. tostring(tpDistance)
+		tpLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+		tpLbl.TextSize = 15; tpLbl.Font = Enum.Font.SourceSans
+		tpLbl.TextXAlignment = Enum.TextXAlignment.Left
+		tpLbl.ZIndex = tpSliderCont.ZIndex + 1; tpLbl.Parent = tpSliderCont
+
+		local tpTrackHit = Instance.new("TextButton")
+		tpTrackHit.Size = UDim2.new(1, -28, 0, 28); tpTrackHit.Position = UDim2.fromOffset(16, 16)
+		tpTrackHit.BackgroundTransparency = 1; tpTrackHit.BorderSizePixel = 0
+		tpTrackHit.Text = ""; tpTrackHit.AutoButtonColor = false
+		tpTrackHit.ZIndex = tpSliderCont.ZIndex + 6; tpTrackHit.Parent = tpSliderCont
+
+		local tpTrackBg = Instance.new("Frame")
+		tpTrackBg.Size = UDim2.new(1, -28, 0, 10); tpTrackBg.Position = UDim2.fromOffset(16, 28)
+		tpTrackBg.BackgroundColor3 = Color3.fromRGB(35, 35, 35); tpTrackBg.BorderSizePixel = 0
+		tpTrackBg.ZIndex = tpSliderCont.ZIndex + 1; tpTrackBg.Parent = tpSliderCont
+		local tpTbC = Instance.new("UICorner"); tpTbC.CornerRadius = UDim.new(1, 0); tpTbC.Parent = tpTrackBg
+		local tpTbS = Instance.new("UIStroke"); tpTbS.Thickness = 1; tpTbS.Color = Color3.fromRGB(50, 50, 50); tpTbS.Parent = tpTrackBg
+
+		local tpFill = Instance.new("Frame")
+		tpFill.BackgroundColor3 = Color3.fromRGB(80, 80, 80); tpFill.BorderSizePixel = 0
+		tpFill.ZIndex = tpSliderCont.ZIndex + 2; tpFill.Parent = tpTrackBg
+		local tpFillC = Instance.new("UICorner"); tpFillC.CornerRadius = UDim.new(1, 0); tpFillC.Parent = tpFill
+
+		local tpKnob = Instance.new("Frame")
+		tpKnob.Size = UDim2.fromOffset(20, 20); tpKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+		tpKnob.BackgroundColor3 = Color3.fromRGB(200, 200, 200); tpKnob.BorderSizePixel = 0
+		tpKnob.ZIndex = tpSliderCont.ZIndex + 5; tpKnob.Parent = tpTrackBg
+		local tpKC = Instance.new("UICorner"); tpKC.CornerRadius = UDim.new(1, 0); tpKC.Parent = tpKnob
+
+		local tpMinV, tpMaxV = 4, 60
+		local function tpUpdateVis()
+			local pct = (tpDistance - tpMinV) / (tpMaxV - tpMinV)
+			tpFill.Size = UDim2.new(pct, 0, 1, 0)
+			tpKnob.Position = UDim2.new(pct, 0, 0.5, 0)
+			tpLbl.Text = "Distance: " .. tostring(tpDistance)
+		end
+		tpUpdateVis()
+
+		local tpDragging = false
+		local function tpApplyX(absX)
+			local x0 = tpTrackHit.AbsolutePosition.X; local w = tpTrackHit.AbsoluteSize.X
+			if w <= 0 then return end
+			local pct = math.clamp((absX - x0) / w, 0, 1)
+			tpDistance = math.floor(tpMinV + (tpMaxV - tpMinV) * pct + 0.5)
+			tpUpdateVis()
+		end
+		track(tpTrackHit.MouseButton1Down:Connect(function() tpDragging = true; tpApplyX(getMouseUiPos().X) end))
+		track(UserInputService.InputEnded:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 then tpDragging = false end
+		end))
+		track(UserInputService.InputChanged:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseWheel then return end
+			if tpDragging and inp.UserInputType == Enum.UserInputType.MouseMovement then tpApplyX(getMouseUiPos().X) end
+		end))
+		track(tpTrackHit.MouseWheelForward:Connect(function()
+			miscContent.CanvasPosition = Vector2.new(miscContent.CanvasPosition.X, math.max(0, miscContent.CanvasPosition.Y - 40))
+		end))
+		track(tpTrackHit.MouseWheelBackward:Connect(function()
+			miscContent.CanvasPosition = Vector2.new(miscContent.CanvasPosition.X, miscContent.CanvasPosition.Y + 40)
+		end))
+
+		addSectionEndLine(miscContent, 35)
+	end
+
+	-- ══════════════════════════════════════════════
+	-- FIELD OF VIEW секция (LayoutOrder 40-49)
+	-- ══════════════════════════════════════════════
+	fovEnabled = false
+	camFov     = 70
+	do
+		local function applyFov()
+			local cam = workspace.CurrentCamera
+			if not cam then return end
+			if fovEnabled then
+				cam.FieldOfView = camFov
+			else
+				cam.FieldOfView = 70
+			end
+		end
+
+		-- Используем RenderStepped с приоритетом Camera — выполняется ПОСЛЕ
+		-- того как игра обновила камеру, но ДО рендера. Это предотвращает
+		-- дёргание, которое возникает когда игра перезаписывает FieldOfView.
+		-- BindToRenderStep не возвращает коннекшн — отписка в unload() через UnbindFromRenderStep
+		RunService:BindToRenderStep("FovChanger", Enum.RenderPriority.Camera.Value + 1, function()
+			if fovEnabled then
+				local cam = workspace.CurrentCamera
+				if cam and cam.FieldOfView ~= camFov then
+					cam.FieldOfView = camFov
+				end
+			end
+		end)
+
+		local div4 = addSectionDivider(miscContent, "FIELD OF VIEW")
+		div4.LayoutOrder = 40
+
+		local fovToggle = addToggle(miscContent, "Field Of View", false, function(v)
+			fovEnabled = v
+			applyFov()
+		end)
+		fovToggle.LayoutOrder = 41
+
+		-- Слайдер FOV (большой, от 30 до 120)
+		local fovSliderCont = Instance.new("Frame")
+		fovSliderCont.Size = UDim2.new(1, 0, 0, 48)
+		fovSliderCont.BackgroundTransparency = 1
+		fovSliderCont.LayoutOrder = 42
+		fovSliderCont.ZIndex = miscContent.ZIndex + 1
+		fovSliderCont.Parent = miscContent
+
+		local fovLbl = Instance.new("TextLabel")
+		fovLbl.Size = UDim2.new(1, -16, 0, 16); fovLbl.Position = UDim2.fromOffset(16, 2)
+		fovLbl.BackgroundTransparency = 1; fovLbl.Text = "FOV: " .. tostring(camFov)
+		fovLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+		fovLbl.TextSize = 15; fovLbl.Font = Enum.Font.SourceSans
+		fovLbl.TextXAlignment = Enum.TextXAlignment.Left
+		fovLbl.ZIndex = fovSliderCont.ZIndex + 1; fovLbl.Parent = fovSliderCont
+
+		local fovTrackHit = Instance.new("TextButton")
+		fovTrackHit.Size = UDim2.new(1, -28, 0, 28); fovTrackHit.Position = UDim2.fromOffset(16, 16)
+		fovTrackHit.BackgroundTransparency = 1; fovTrackHit.BorderSizePixel = 0
+		fovTrackHit.Text = ""; fovTrackHit.AutoButtonColor = false
+		fovTrackHit.ZIndex = fovSliderCont.ZIndex + 6; fovTrackHit.Parent = fovSliderCont
+
+		local fovTrackBg = Instance.new("Frame")
+		fovTrackBg.Size = UDim2.new(1, -28, 0, 10); fovTrackBg.Position = UDim2.fromOffset(16, 28)
+		fovTrackBg.BackgroundColor3 = Color3.fromRGB(35, 35, 35); fovTrackBg.BorderSizePixel = 0
+		fovTrackBg.ZIndex = fovSliderCont.ZIndex + 1; fovTrackBg.Parent = fovSliderCont
+		local fovTbC = Instance.new("UICorner"); fovTbC.CornerRadius = UDim.new(1, 0); fovTbC.Parent = fovTrackBg
+		local fovTbS = Instance.new("UIStroke"); fovTbS.Thickness = 1; fovTbS.Color = Color3.fromRGB(50, 50, 50); fovTbS.Parent = fovTrackBg
+
+		local fovFill = Instance.new("Frame")
+		fovFill.BackgroundColor3 = Color3.fromRGB(80, 80, 80); fovFill.BorderSizePixel = 0
+		fovFill.ZIndex = fovSliderCont.ZIndex + 2; fovFill.Parent = fovTrackBg
+		local fovFillC = Instance.new("UICorner"); fovFillC.CornerRadius = UDim.new(1, 0); fovFillC.Parent = fovFill
+
+		local fovKnob = Instance.new("Frame")
+		fovKnob.Size = UDim2.fromOffset(20, 20); fovKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+		fovKnob.BackgroundColor3 = Color3.fromRGB(200, 200, 200); fovKnob.BorderSizePixel = 0
+		fovKnob.ZIndex = fovSliderCont.ZIndex + 5; fovKnob.Parent = fovTrackBg
+		local fovKC = Instance.new("UICorner"); fovKC.CornerRadius = UDim.new(1, 0); fovKC.Parent = fovKnob
+
+		local fovMinV, fovMaxV = 30, 120
+		local function fovUpdateVis()
+			local pct = (camFov - fovMinV) / (fovMaxV - fovMinV)
+			fovFill.Size = UDim2.new(pct, 0, 1, 0)
+			fovKnob.Position = UDim2.new(pct, 0, 0.5, 0)
+			fovLbl.Text = "FOV: " .. tostring(camFov)
+			-- fov обновляется через Heartbeat автоматически
+		end
+		fovUpdateVis()
+
+		local fovDragging = false
+		local function fovApplyX(absX)
+			local x0 = fovTrackHit.AbsolutePosition.X; local w = fovTrackHit.AbsoluteSize.X
+			if w <= 0 then return end
+			local pct = math.clamp((absX - x0) / w, 0, 1)
+			camFov = math.floor(fovMinV + (fovMaxV - fovMinV) * pct + 0.5)
+			fovUpdateVis()
+		end
+		track(fovTrackHit.MouseButton1Down:Connect(function() fovDragging = true; fovApplyX(getMouseUiPos().X) end))
+		track(UserInputService.InputEnded:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 then fovDragging = false end
+		end))
+		track(UserInputService.InputChanged:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseWheel then return end
+			if fovDragging and inp.UserInputType == Enum.UserInputType.MouseMovement then fovApplyX(getMouseUiPos().X) end
+		end))
+		track(fovTrackHit.MouseWheelForward:Connect(function()
+			miscContent.CanvasPosition = Vector2.new(miscContent.CanvasPosition.X, math.max(0, miscContent.CanvasPosition.Y - 40))
+		end))
+		track(fovTrackHit.MouseWheelBackward:Connect(function()
+			miscContent.CanvasPosition = Vector2.new(miscContent.CanvasPosition.X, miscContent.CanvasPosition.Y + 40)
+		end))
+
+		addSectionEndLine(miscContent, 45)
 	end
 
 	-- ── exploits page ──
-	local exploitsContent = Instance.new("Frame")
+	local exploitsContent = Instance.new("ScrollingFrame")
 	exploitsContent.BackgroundTransparency = 1; exploitsContent.Position = UDim2.fromOffset(0,15)
 	exploitsContent.Size = UDim2.new(1,0,1,-15); exploitsContent.Parent = pages["exploits"]
-	local el2 = Instance.new("UIListLayout"); el2.Padding = UDim.new(0,5); el2.Parent = exploitsContent
-	addToggle(exploitsContent, "Fly",     false, function(v) print("test") end)
-	addToggle(exploitsContent, "Noclip",  false, function(v) print("test") end)
-	addToggle(exploitsContent, "Airjump", false, function(v) print("test") end)
-	addToggle(exploitsContent, "Speed",   false, function(v) print("test") end)
+	exploitsContent.ScrollBarThickness = 3
+	exploitsContent.ScrollBarImageColor3 = Color3.fromRGB(80,80,80)
+	exploitsContent.BorderSizePixel = 0
+	exploitsContent.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	exploitsContent.CanvasSize = UDim2.new(0,0,0,0)
+	exploitsContent.ClipsDescendants = true
+	exploitsContent.ScrollingEnabled = true
+	exploitsContent.ElasticBehavior = Enum.ElasticBehavior.Never
+	local el2 = Instance.new("UIListLayout"); el2.Padding = UDim.new(0,0); el2.SortOrder = Enum.SortOrder.LayoutOrder; el2.Parent = exploitsContent
+
+	-- ── Sprint State ───────────────────────────────────────────────────────────
+	local sprintEnabled = false
+	local _sprintShiftConn = nil
+
+	local WASD_KEYS = {
+		[Enum.KeyCode.W] = true,
+		[Enum.KeyCode.A] = true,
+		[Enum.KeyCode.S] = true,
+		[Enum.KeyCode.D] = true,
+	}
+
+	local function isMoving()
+		for key in pairs(WASD_KEYS) do
+			if UserInputService:IsKeyDown(key) then return true end
+		end
+		return false
+	end
+
+	local _sprintVim = nil
+	pcall(function() _sprintVim = game:GetService("VirtualInputManager") end)
+
+	local _shiftHeld = false
+
+	local function setShift(hold)
+		if hold == _shiftHeld then return end
+		_shiftHeld = hold
+		if _sprintVim and _sprintVim.SendKeyEvent then
+			pcall(function()
+				_sprintVim:SendKeyEvent(hold, Enum.KeyCode.LeftShift, false, game)
+			end)
+		end
+	end
+
+	local function startSprint()
+		if _sprintShiftConn then return end
+		_sprintShiftConn = RunService.Heartbeat:Connect(function()
+			if not sprintEnabled then return end
+			local moving = isMoving()
+			setShift(moving)
+		end)
+		table.insert(conns, _sprintShiftConn)
+	end
+
+	local function stopSprint()
+		setShift(false)
+		if _sprintShiftConn then
+			pcall(function() _sprintShiftConn:Disconnect() end)
+			_sprintShiftConn = nil
+		end
+	end
+	_globalStopSprint = stopSprint
+
+	-- ── Sprint UI ──────────────────────────────────────────────────────────────
+
+	-- Header
+	local sprintTitleRow = Instance.new("Frame")
+	sprintTitleRow.Size = UDim2.new(1,-20,0,22); sprintTitleRow.BackgroundTransparency=1
+	sprintTitleRow.LayoutOrder=1; sprintTitleRow.ZIndex=exploitsContent.ZIndex+1; sprintTitleRow.Parent=exploitsContent
+	local sprintTitleLbl = Instance.new("TextLabel")
+	sprintTitleLbl.Size=UDim2.new(1,0,1,0); sprintTitleLbl.Position=UDim2.fromOffset(16,0)
+	sprintTitleLbl.BackgroundTransparency=1; sprintTitleLbl.Text="SPRINT"
+	sprintTitleLbl.TextColor3=Color3.fromRGB(130,130,130)
+	sprintTitleLbl.TextSize=12; sprintTitleLbl.Font=Enum.Font.GothamBold
+	sprintTitleLbl.TextXAlignment=Enum.TextXAlignment.Left
+	sprintTitleLbl.ZIndex=sprintTitleRow.ZIndex+1; sprintTitleLbl.Parent=sprintTitleRow
+
+	local sprintToggle = addToggle(exploitsContent, "Auto Sprint", false, function(v)
+		sprintEnabled = v
+		if v then startSprint() else stopSprint() end
+	end)
+	sprintToggle.LayoutOrder = 2
+
+	-- divider before YAW
+	local sprintDiv = Instance.new("Frame")
+	sprintDiv.Size=UDim2.new(1,-20,0,10); sprintDiv.BackgroundTransparency=1
+	sprintDiv.LayoutOrder=3; sprintDiv.ZIndex=exploitsContent.ZIndex+1; sprintDiv.Parent=exploitsContent
+	local sprintDivLine = Instance.new("Frame")
+	sprintDivLine.Size=UDim2.new(1,-24,0,1); sprintDivLine.Position=UDim2.fromOffset(12,5)
+	sprintDivLine.BackgroundColor3=Color3.fromRGB(55,55,55); sprintDivLine.BorderSizePixel=0
+	sprintDivLine.ZIndex=sprintDiv.ZIndex+1; sprintDivLine.Parent=sprintDiv
+
+	-- ── Yaw Rotator State ──────────────────────────────────────────────────
+	local YAW = {
+		enabled        = false,
+		atTargets      = false,
+		activeProfile  = "Standing",
+		profiles = {
+			Standing = { pitch="Back", pitchCustom=180, mode="Jitter", jitter=false, jitterSpeed=10, spinSpeed=5 },
+			Moving   = { pitch="Back", pitchCustom=180, mode="Jitter", jitter=false, jitterSpeed=10, spinSpeed=5 },
+			Jumping  = { pitch="Back", pitchCustom=180, mode="Jitter", jitter=false, jitterSpeed=10, spinSpeed=5 },
+		},
+		-- Manual
+		manualEnabled  = false,
+		manualActive   = false,
+		manualLeftKey  = Enum.KeyCode.Z,
+		manualRightKey = Enum.KeyCode.C,
+		manualMode     = "toggle",  -- "toggle"|"hold"|"always"
+	}
+
+	local _yrConn      = nil
+	local _jitterSign  = 1
+	local _spinAngle   = 0
+	local _lastJitter  = 0
+
+	local function yrGetProfile(name)
+		local p = YAW.profiles[name]
+		if type(p) ~= "table" then
+			YAW.profiles[name] = { pitch="Back", pitchCustom=180, mode="Jitter", jitter=false, jitterSpeed=10, spinSpeed=5 }
+			p = YAW.profiles[name]
+		end
+		return p
+	end
+	local function yrActiveProfile()
+		return yrGetProfile(YAW.activeProfile or "Standing")
+	end
+
+	local function yrGetPitchAngle(prof)
+		local p = prof.pitch
+		if p == "Forward" then return math.rad(0)   end
+		if p == "Back"    then return math.rad(180) end
+		if p == "Right"   then return math.rad(-90) end
+		if p == "Left"    then return math.rad(90)  end
+		return math.rad(prof.pitchCustom or 180)
+	end
+
+	local function yrApplyHRP(hrp, yawAngle)
+		local pos     = hrp.Position
+		local lookDir = Vector3.new(math.sin(yawAngle), 0, math.cos(yawAngle))
+		hrp.CFrame    = CFrame.new(pos) * CFrame.lookAt(Vector3.zero, lookDir)
+	end
+
+	local function yrGetPlayerState(hum)
+		if not hum then return "Standing" end
+		local st = hum:GetState()
+		if st == Enum.HumanoidStateType.Jumping
+		or st == Enum.HumanoidStateType.Freefall
+		or st == Enum.HumanoidStateType.Flying then return "Jumping" end
+		if hum.MoveDirection.Magnitude > 0.1 then return "Moving" end
+		return "Standing"
+	end
+
+	local YAW_RENDER_NAME = "_AntiLoseYawRotator"
+	local YAW_PRIORITY    = Enum.RenderPriority.Last.Value
+
+	local _yrClimbRP = RaycastParams.new()
+	_yrClimbRP.FilterType = Enum.RaycastFilterType.Exclude
+	local PROBE_DIRS = {
+		Vector3.new(1,0,0), Vector3.new(-1,0,0),
+		Vector3.new(0,0,1), Vector3.new(0,0,-1),
+		Vector3.new(0,1,0), Vector3.new(0,-1,0),
+	}
+	local function yrIsClimbing(hrp, hum, char)
+		if hum:GetState() == Enum.HumanoidStateType.Climbing then return true end
+		_yrClimbRP.FilterDescendantsInstances = { char }
+		for _, dir in ipairs(PROBE_DIRS) do
+			local hit = workspace:Raycast(hrp.Position, dir * 2.8, _yrClimbRP)
+			if hit and hit.Instance and hit.Instance:IsA("TrussPart") then return true end
+		end
+		return false
+	end
+
+	local function startYawRotator()
+		if _yrConn then return end
+		_yrConn = true
+		RunService:BindToRenderStep(YAW_RENDER_NAME, YAW_PRIORITY, function(dt)
+			if not YAW.enabled then return end
+			local char = localPlayer.Character
+			local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+			local hum  = char and char:FindFirstChildOfClass("Humanoid")
+			if not hrp or not hum then return end
+			if yrIsClimbing(hrp, hum, char) then
+				if not hum.AutoRotate then hum.AutoRotate = true end
+				return
+			end
+			if hum.AutoRotate then hum.AutoRotate = false end
+
+			local pStateName = yrGetPlayerState(hum)
+			local prof       = yrGetProfile(pStateName)
+			local baseAngle  = yrGetPitchAngle(prof)
+			local mode       = prof.mode or "Jitter"
+
+			if mode == "Spin" then
+				_spinAngle = _spinAngle + dt * math.rad((prof.spinSpeed or 5) * 60)
+				yrApplyHRP(hrp, _spinAngle)
+				return
+			end
+
+			local lv     = Camera.CFrame.LookVector
+			local camYaw = math.atan2(lv.X, lv.Z)
+
+			if mode == "Jitter" and prof.jitter then
+				local rate = 1 / math.max(prof.jitterSpeed or 10, 1)
+				local now  = tick()
+				if now - _lastJitter >= rate then
+					_jitterSign = -_jitterSign
+					_lastJitter = now
+				end
+				yrApplyHRP(hrp, camYaw + baseAngle + math.rad(20) * _jitterSign)
+			else
+				yrApplyHRP(hrp, camYaw + baseAngle)
+			end
+		end)
+	end
+
+	local function stopYawRotator()
+		if _yrConn then
+			pcall(function() RunService:UnbindFromRenderStep(YAW_RENDER_NAME) end)
+			_yrConn = nil
+		end
+		local char = localPlayer.Character
+		local hum  = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.AutoRotate = true end
+		_spinAngle = 0
+	end
+
+	-- watch enable/disable
+	local _prevYawEnabled = false
+	track(RunService.Heartbeat:Connect(function()
+		if YAW.enabled ~= _prevYawEnabled then
+			_prevYawEnabled = YAW.enabled
+			if YAW.enabled then startYawRotator() else stopYawRotator() end
+		end
+	end))
+
+	track(Players.LocalPlayer.CharacterAdded:Connect(function()
+		_spinAngle = 0; _jitterSign = 1
+		if YAW.enabled then
+			task.wait(0.1)
+			stopYawRotator()
+			startYawRotator()
+		end
+	end))
+
+	-- ── Manual key handling ────────────────────────────────────────────────
+	local function yrShiftAllProfiles(delta)
+		-- delta > 0 = Right, delta < 0 = Left
+		local target = delta > 0 and "Right" or "Left"
+		for _, name in ipairs({"Standing","Moving","Jumping"}) do
+			local prof = YAW.profiles[name]
+			if prof and prof.pitch ~= "Custom" then
+				prof.pitch = (prof.pitch == target) and "Back" or target
+			end
+		end
+	end
+
+	track(UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if not YAW.manualEnabled then return end
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+		if input.KeyCode == YAW.manualLeftKey then
+			yrShiftAllProfiles(-1)   -- Left key → pitch Left
+		elseif input.KeyCode == YAW.manualRightKey then
+			yrShiftAllProfiles(1)    -- Right key → pitch Right
+		end
+	end))
+
+	-- ── addExploitSlider helper ────────────────────────────────────────────
+	local function addExploitSlider(parent, labelText, getVal, setVal, minV, maxV, inc, lo)
+		local rowH = 38
+		local container = Instance.new("Frame")
+		container.Size = UDim2.new(1, -20, 0, rowH)
+		container.BackgroundTransparency = 1
+		container.ZIndex = parent.ZIndex + 1
+		container.LayoutOrder = lo or 0
+		container.Parent = parent
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1,-16,0,16); lbl.Position = UDim2.fromOffset(16,2)
+		lbl.BackgroundTransparency = 1
+		lbl.TextColor3 = Color3.fromRGB(200,200,200)
+		lbl.TextSize = 15; lbl.Font = Enum.Font.SourceSans
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.ZIndex = container.ZIndex+1; lbl.Parent = container
+
+		local function fmtVal(v)
+			if inc and inc < 1 then return string.format("%.2f", v) end
+			return tostring(math.floor(v))
+		end
+		lbl.Text = labelText .. ": " .. fmtVal(getVal())
+
+		local trackHit = Instance.new("TextButton")
+		trackHit.Size = UDim2.new(1,-28,0,20); trackHit.Position = UDim2.fromOffset(16,15)
+		trackHit.BackgroundTransparency = 1; trackHit.BorderSizePixel = 0
+		trackHit.Text = ""; trackHit.AutoButtonColor = false
+		trackHit.ZIndex = container.ZIndex+6; trackHit.Parent = container
+
+		local trackBg = Instance.new("Frame")
+		trackBg.Size = UDim2.new(1,-28,0,6); trackBg.Position = UDim2.fromOffset(16,22)
+		trackBg.BackgroundColor3 = Color3.fromRGB(35,35,35); trackBg.BorderSizePixel = 0
+		trackBg.ZIndex = container.ZIndex+1; trackBg.Parent = container
+		local tbC = Instance.new("UICorner"); tbC.CornerRadius = UDim.new(1,0); tbC.Parent = trackBg
+		local tbS = Instance.new("UIStroke"); tbS.Thickness = 1; tbS.Color = Color3.fromRGB(50,50,50); tbS.Parent = trackBg
+
+		local fill = Instance.new("Frame")
+		fill.BackgroundColor3 = Color3.fromRGB(80,80,80); fill.BorderSizePixel = 0
+		fill.ZIndex = container.ZIndex+2; fill.Parent = trackBg
+		local fC = Instance.new("UICorner"); fC.CornerRadius = UDim.new(1,0); fC.Parent = fill
+
+		local knob = Instance.new("Frame")
+		knob.Size = UDim2.fromOffset(14,14); knob.AnchorPoint = Vector2.new(0.5,0.5)
+		knob.BackgroundColor3 = Color3.fromRGB(200,200,200); knob.BorderSizePixel = 0
+		knob.ZIndex = container.ZIndex+5; knob.Parent = trackBg
+		local kC = Instance.new("UICorner"); kC.CornerRadius = UDim.new(1,0); kC.Parent = knob
+
+		local sepLine = Instance.new("Frame")
+		sepLine.Size = UDim2.new(1,-24,0,1); sepLine.Position = UDim2.new(0,12,1,-1)
+		sepLine.BackgroundColor3 = Color3.fromRGB(45,45,45); sepLine.BorderSizePixel = 0
+		sepLine.ZIndex = container.ZIndex+1; sepLine.Parent = container
+
+		local function updateVis()
+			local v = getVal()
+			local pct = math.clamp((v - minV) / (maxV - minV), 0, 1)
+			fill.Size = UDim2.new(pct,0,1,0); knob.Position = UDim2.new(pct,0,0.5,0)
+			lbl.Text = labelText .. ": " .. fmtVal(v)
+		end
+		updateVis()
+
+		local dragging = false
+		local function applyX(absX)
+			local x0 = trackHit.AbsolutePosition.X; local w = trackHit.AbsoluteSize.X
+			if w <= 0 then return end
+			local pct = math.clamp((absX - x0) / w, 0, 1)
+			local raw = minV + (maxV - minV) * pct
+			if inc then raw = math.floor(raw / inc + 0.5) * inc end
+			setVal(math.clamp(raw, minV, maxV))
+			updateVis()
+		end
+
+		track(trackHit.MouseButton1Down:Connect(function() dragging=true; applyX(getMouseUiPos().X) end))
+		track(UserInputService.InputEnded:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging=false end
+		end))
+		track(UserInputService.InputChanged:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseWheel then return end
+			if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then applyX(getMouseUiPos().X) end
+		end))
+		track(trackHit.MouseWheelForward:Connect(function()
+			exploitsContent.CanvasPosition = Vector2.new(exploitsContent.CanvasPosition.X, math.max(0, exploitsContent.CanvasPosition.Y-40))
+		end))
+		track(trackHit.MouseWheelBackward:Connect(function()
+			exploitsContent.CanvasPosition = Vector2.new(exploitsContent.CanvasPosition.X, exploitsContent.CanvasPosition.Y+40)
+		end))
+
+		return container, updateVis
+	end
+
+	-- ── addExploitDropdown helper ──────────────────────────────────────────
+	local function addExploitDropdown(parent, labelText, options, getVal, setVal, lo)
+		local container = Instance.new("Frame")
+		container.Name = labelText .. "Drop"
+		container.Size = UDim2.new(1,-20,0,32)
+		container.BackgroundTransparency = 1
+		container.ZIndex = parent.ZIndex+1
+		container.LayoutOrder = lo or 0
+		container.Parent = parent
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1,-120,1,0); lbl.Position = UDim2.fromOffset(16,0)
+		lbl.BackgroundTransparency = 1; lbl.Text = labelText
+		lbl.TextColor3 = Color3.fromRGB(200,200,200)
+		lbl.TextSize = 16; lbl.Font = Enum.Font.SourceSans
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.ZIndex = container.ZIndex+1; lbl.Parent = container
+
+		local btn = Instance.new("TextButton")
+		btn.AnchorPoint = Vector2.new(1,0.5); btn.Position = UDim2.new(1,-12,0.5,-1)
+		btn.Size = UDim2.fromOffset(96,20)
+		btn.BackgroundColor3 = Color3.fromRGB(28,28,28)
+		btn.BorderSizePixel = 0; btn.AutoButtonColor = false
+		btn.TextColor3 = Color3.fromRGB(200,200,200)
+		btn.TextSize = 13; btn.Font = Enum.Font.SourceSans
+		btn.Text = tostring(getVal()) .. " ▾"
+		btn.ZIndex = container.ZIndex+2; btn.Parent = container
+		local bC = Instance.new("UICorner"); bC.CornerRadius = UDim.new(0,3); bC.Parent = btn
+		local bS = Instance.new("UIStroke"); bS.Thickness = 1; bS.Color = Color3.fromRGB(55,55,55); bS.Parent = btn
+
+		local sepLine = Instance.new("Frame")
+		sepLine.Size = UDim2.new(1,-24,0,1); sepLine.Position = UDim2.new(0,12,1,-1)
+		sepLine.BackgroundColor3 = Color3.fromRGB(45,45,45); sepLine.BorderSizePixel = 0
+		sepLine.ZIndex = container.ZIndex+1; sepLine.Parent = container
+
+		local function refreshBtn() btn.Text = tostring(getVal()) .. " ▾" end
+
+		local dropOpen = false; local dropFrame = nil; local dropOverlay = nil
+		local function closeDrop()
+			dropOpen = false
+			if dropFrame   then pcall(function() dropFrame:Destroy()   end); dropFrame   = nil end
+			if dropOverlay then pcall(function() dropOverlay:Destroy() end); dropOverlay = nil end
+		end
+		local function openDrop()
+			if dropOpen then closeDrop(); return end
+			dropOpen = true
+			local itemH = 22; local dropH = #options * itemH + 6
+			dropOverlay = Instance.new("TextButton")
+			dropOverlay.BackgroundTransparency=1; dropOverlay.BorderSizePixel=0
+			dropOverlay.Size=UDim2.new(1,0,1,0); dropOverlay.Text=""
+			dropOverlay.AutoButtonColor=false; dropOverlay.ZIndex=198; dropOverlay.Parent=sg
+			track(dropOverlay.MouseButton1Click:Connect(closeDrop))
+			dropFrame = Instance.new("Frame")
+			dropFrame.ZIndex=199; dropFrame.BorderSizePixel=0
+			dropFrame.Size = UDim2.fromOffset(btn.AbsoluteSize.X+20, dropH)
+			local ap = btn.AbsolutePosition
+			dropFrame.Position = UDim2.fromOffset(ap.X-10, ap.Y+btn.AbsoluteSize.Y+2)
+			local dfOB = Instance.new("Frame"); dfOB.Size=UDim2.new(1,0,1,0)
+			dfOB.BackgroundColor3=Color3.fromRGB(0,0,0); dfOB.BorderSizePixel=0; dfOB.ZIndex=199; dfOB.Parent=dropFrame
+			local dfOG = Instance.new("Frame"); dfOG.Position=UDim2.fromOffset(1,1); dfOG.Size=UDim2.new(1,-2,1,-2)
+			dfOG.BackgroundColor3=Color3.fromRGB(60,60,60); dfOG.BorderSizePixel=0; dfOG.ZIndex=199; dfOG.Parent=dfOB
+			local dfIn = Instance.new("Frame"); dfIn.Position=UDim2.fromOffset(1,1); dfIn.Size=UDim2.new(1,-2,1,-2)
+			dfIn.BackgroundColor3=Color3.fromRGB(22,22,22); dfIn.BorderSizePixel=0; dfIn.ZIndex=199; dfIn.Parent=dfOG
+			dropFrame.BackgroundTransparency=1; dropFrame.Parent=sg
+			for i, opt in ipairs(options) do
+				local isOn = tostring(getVal()) == tostring(opt)
+				local item = Instance.new("TextButton")
+				item.Size=UDim2.new(1,-6,0,itemH-2); item.Position=UDim2.fromOffset(3,3+(i-1)*itemH)
+				item.BackgroundColor3=isOn and Color3.fromRGB(60,60,60) or Color3.fromRGB(28,28,28)
+				item.BorderSizePixel=0; item.AutoButtonColor=false
+				item.Text=(isOn and "✓  " or "    ")..tostring(opt)
+				item.TextColor3=isOn and Color3.fromRGB(230,230,230) or Color3.fromRGB(160,160,160)
+				item.TextSize=13; item.Font=Enum.Font.SourceSans
+				item.TextXAlignment=Enum.TextXAlignment.Left
+				item.ZIndex=204; item.Parent=dfIn
+				local iC=Instance.new("UICorner"); iC.CornerRadius=UDim.new(0,3); iC.Parent=item
+				local iP=Instance.new("UIPadding"); iP.PaddingLeft=UDim.new(0,8); iP.Parent=item
+				track(item.MouseButton1Click:Connect(function()
+					setVal(opt)
+					refreshBtn()
+					closeDrop()
+				end))
+			end
+		end
+		track(btn.MouseButton1Click:Connect(openDrop))
+		return container, refreshBtn
+	end
+
+	-- ── addExploitKeybind helper ───────────────────────────────────────────
+	local function addExploitKeybind(parent, labelText, getKey, setKey, lo)
+		local bindListening = false
+		local bindDotAnim   = nil
+
+		local container = Instance.new("Frame")
+		container.Size = UDim2.new(1,-20,0,32)
+		container.BackgroundTransparency = 1
+		container.ZIndex = parent.ZIndex+1
+		container.LayoutOrder = lo or 0
+		container.Parent = parent
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1,-120,1,0); lbl.Position = UDim2.fromOffset(16,0)
+		lbl.BackgroundTransparency = 1; lbl.Text = labelText
+		lbl.TextColor3 = Color3.fromRGB(200,200,200)
+		lbl.TextSize = 16; lbl.Font = Enum.Font.SourceSans
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.ZIndex = container.ZIndex+1; lbl.Parent = container
+
+		local function keyName(k)
+			if typeof(k) == "EnumItem" then
+				return tostring(k):gsub("Enum%.KeyCode%.", "")
+			end
+			return tostring(k)
+		end
+
+		local bindBtn = Instance.new("TextButton")
+		bindBtn.AnchorPoint = Vector2.new(1,0.5); bindBtn.Position = UDim2.new(1,-12,0.5,-1)
+		bindBtn.Size = UDim2.fromOffset(96,20)
+		bindBtn.BackgroundColor3 = Color3.fromRGB(28,28,28)
+		bindBtn.BorderSizePixel = 0; bindBtn.AutoButtonColor = false
+		bindBtn.TextColor3 = Color3.fromRGB(200,200,200)
+		bindBtn.TextSize = 13; bindBtn.Font = Enum.Font.SourceSans
+		bindBtn.Text = keyName(getKey())
+		bindBtn.ZIndex = container.ZIndex+2; bindBtn.Parent = container
+		local bbC = Instance.new("UICorner"); bbC.CornerRadius = UDim.new(0,3); bbC.Parent = bindBtn
+		local bbS = Instance.new("UIStroke"); bbS.Thickness = 1; bbS.Color = Color3.fromRGB(55,55,55); bbS.Parent = bindBtn
+
+		local sepLine = Instance.new("Frame")
+		sepLine.Size = UDim2.new(1,-24,0,1); sepLine.Position = UDim2.new(0,12,1,-1)
+		sepLine.BackgroundColor3 = Color3.fromRGB(45,45,45); sepLine.BorderSizePixel = 0
+		sepLine.ZIndex = container.ZIndex+1; sepLine.Parent = container
+
+		local bindInputConn = nil
+		local function stopListening()
+			bindListening = false
+			if bindDotAnim then bindDotAnim:Disconnect(); bindDotAnim = nil end
+			bindBtn.Text = keyName(getKey())
+			bindBtn.TextColor3 = Color3.fromRGB(200,200,200)
+			bbS.Color = Color3.fromRGB(55,55,55)
+			if bindInputConn then bindInputConn:Disconnect(); bindInputConn = nil end
+		end
+		local function startListening()
+			if bindListening then stopListening(); return end
+			bindListening = true
+			local dots = 0
+			bindDotAnim = RunService.RenderStepped:Connect(function()
+				dots = (dots+1)%4
+				bindBtn.Text = string.rep(".", dots==0 and 3 or dots)
+				bindBtn.TextColor3 = Color3.fromRGB(255,255,120)
+				bbS.Color = Color3.fromRGB(180,180,60)
+			end)
+			bindInputConn = UserInputService.InputBegan:Connect(function(input, gp)
+				if not bindListening then return end
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+				if input.KeyCode == Enum.KeyCode.Escape then stopListening(); return end
+				setKey(input.KeyCode)
+				stopListening()
+			end)
+		end
+		track(bindBtn.MouseButton1Click:Connect(startListening))
+		return container
+	end
+
+	-- ── addExploitSectionDiv helper ────────────────────────────────────────
+	local function addExploitDiv(parent, lo)
+		local div = Instance.new("Frame")
+		div.Size = UDim2.new(1,0,0,10); div.BackgroundTransparency = 1
+		div.LayoutOrder = lo; div.ZIndex = parent.ZIndex+1; div.Parent = parent
+		local line = Instance.new("Frame")
+		line.Size = UDim2.new(1,-24,0,1); line.Position = UDim2.fromOffset(12,5)
+		line.BackgroundColor3 = Color3.fromRGB(55,55,55); line.BorderSizePixel=0
+		line.ZIndex=div.ZIndex+1; line.Parent=div
+		return div
+	end
+
+	-- ── Profile buttons row ────────────────────────────────────────────────
+	-- Profile selector (3 buttons: Standing / Moving / Jumping)
+	local _yrProfileBtns = {}
+	local _yrModeRefresh    = nil
+	local _yrPitchRefresh   = nil
+	local _yrCustomSlidUpd  = nil
+	local _yrJitterTog      = nil
+	local _yrJitterSlidUpd  = nil
+	local _yrSpinSlidUpd    = nil
+
+	local function yrLoadProfileUI()
+		local prof = yrActiveProfile()
+		if _yrModeRefresh  then _yrModeRefresh()  end
+		if _yrPitchRefresh then _yrPitchRefresh() end
+		if _yrCustomSlidUpd then _yrCustomSlidUpd() end
+		if _yrJitterSlidUpd then _yrJitterSlidUpd() end
+		if _yrSpinSlidUpd  then _yrSpinSlidUpd()  end
+		-- update jitter toggle
+		if _yrJitterTog then
+			local prof2 = yrActiveProfile()
+			setToggleState(_yrJitterTog, prof2.jitter or false, false)
+		end
+		-- highlight active profile button
+		for name, pbtn in pairs(_yrProfileBtns) do
+			local isActive = (name == (YAW.activeProfile or "Standing"))
+			pbtn.BackgroundColor3 = isActive and Color3.fromRGB(60,60,60) or Color3.fromRGB(28,28,28)
+			pbtn.TextColor3 = isActive and Color3.fromRGB(230,230,230) or Color3.fromRGB(160,160,160)
+		end
+	end
+
+	-- ══════════════════════════════
+	-- YAW ROTATOR секция
+	-- ══════════════════════════════
+
+	-- Header divider
+	addExploitDiv(exploitsContent, 100)
+
+	-- Title label
+	local yrTitleRow = Instance.new("Frame")
+	yrTitleRow.Size = UDim2.new(1,-20,0,22); yrTitleRow.BackgroundTransparency=1
+	yrTitleRow.LayoutOrder=101; yrTitleRow.ZIndex=exploitsContent.ZIndex+1; yrTitleRow.Parent=exploitsContent
+	local yrTitleLbl = Instance.new("TextLabel")
+	yrTitleLbl.Size=UDim2.new(1,0,1,0); yrTitleLbl.Position=UDim2.fromOffset(16,0)
+	yrTitleLbl.BackgroundTransparency=1; yrTitleLbl.Text="YAW ROTATOR"
+	yrTitleLbl.TextColor3=Color3.fromRGB(130,130,130)
+	yrTitleLbl.TextSize=12; yrTitleLbl.Font=Enum.Font.GothamBold
+	yrTitleLbl.TextXAlignment=Enum.TextXAlignment.Left
+	yrTitleLbl.ZIndex=yrTitleRow.ZIndex+1; yrTitleLbl.Parent=yrTitleRow
+
+	-- Enable Yaw Rotator toggle
+	local yrEnableToggle = addToggle(exploitsContent, "Yaw Rotator", false, function(v)
+		YAW.enabled = v
+	end)
+	yrEnableToggle.LayoutOrder = 102
+
+	-- At Targets toggle
+	local yrAtTargetsToggle = addToggle(exploitsContent, "At Targets", false, function(v)
+		YAW.atTargets = v
+	end)
+	yrAtTargetsToggle.LayoutOrder = 103
+
+	-- ── Profile selector buttons ────────────────────────────────────────────
+	local yrProfilesRow = Instance.new("Frame")
+	yrProfilesRow.Size = UDim2.new(1,-20,0,32); yrProfilesRow.BackgroundTransparency=1
+	yrProfilesRow.LayoutOrder=104; yrProfilesRow.ZIndex=exploitsContent.ZIndex+1; yrProfilesRow.Parent=exploitsContent
+
+	local yrProfilesLbl = Instance.new("TextLabel")
+	yrProfilesLbl.Size=UDim2.new(0,80,1,-2); yrProfilesLbl.Position=UDim2.fromOffset(16,0)
+	yrProfilesLbl.BackgroundTransparency=1; yrProfilesLbl.Text="Profile"
+	yrProfilesLbl.TextColor3=Color3.fromRGB(200,200,200)
+	yrProfilesLbl.TextSize=16; yrProfilesLbl.Font=Enum.Font.SourceSans
+	yrProfilesLbl.TextXAlignment=Enum.TextXAlignment.Left
+	yrProfilesLbl.ZIndex=yrProfilesRow.ZIndex+1; yrProfilesLbl.Parent=yrProfilesRow
+
+	local PROF_NAMES = {"Standing","Moving","Jumping"}
+	for i, name in ipairs(PROF_NAMES) do
+		local pb = Instance.new("TextButton")
+		pb.Size = UDim2.fromOffset(62, 20)
+		pb.AnchorPoint = Vector2.new(1,0.5)
+		pb.Position = UDim2.new(1, -12 - (3-i)*66, 0.5, -1)
+		pb.BackgroundColor3 = (name == "Standing") and Color3.fromRGB(60,60,60) or Color3.fromRGB(28,28,28)
+		pb.BorderSizePixel = 0; pb.AutoButtonColor = false
+		pb.TextColor3 = (name == "Standing") and Color3.fromRGB(230,230,230) or Color3.fromRGB(160,160,160)
+		pb.TextSize = 11; pb.Font = Enum.Font.SourceSans; pb.Text = name
+		pb.ZIndex = yrProfilesRow.ZIndex+2; pb.Parent = yrProfilesRow
+		local pbC = Instance.new("UICorner"); pbC.CornerRadius=UDim.new(0,3); pbC.Parent=pb
+		local pbS = Instance.new("UIStroke"); pbS.Thickness=1; pbS.Color=Color3.fromRGB(55,55,55); pbS.Parent=pb
+		_yrProfileBtns[name] = pb
+		track(pb.MouseButton1Click:Connect(function()
+			YAW.activeProfile = name
+			yrLoadProfileUI()
+		end))
+	end
+
+	local yrProfSep = Instance.new("Frame")
+	yrProfSep.Size=UDim2.new(1,-24,0,1); yrProfSep.Position=UDim2.new(0,12,1,-1)
+	yrProfSep.BackgroundColor3=Color3.fromRGB(45,45,45); yrProfSep.BorderSizePixel=0
+	yrProfSep.ZIndex=yrProfilesRow.ZIndex+1; yrProfSep.Parent=yrProfilesRow
+
+	-- ── Profile settings label ──────────────────────────────────────────────
+	local yrProfTitle = Instance.new("Frame")
+	yrProfTitle.Size=UDim2.new(1,-20,0,18); yrProfTitle.BackgroundTransparency=1
+	yrProfTitle.LayoutOrder=105; yrProfTitle.ZIndex=exploitsContent.ZIndex+1; yrProfTitle.Parent=exploitsContent
+	local yrProfTitleLbl = Instance.new("TextLabel")
+	yrProfTitleLbl.Size=UDim2.new(1,0,1,0); yrProfTitleLbl.Position=UDim2.fromOffset(16,0)
+	yrProfTitleLbl.BackgroundTransparency=1; yrProfTitleLbl.Text="Profile Settings"
+	yrProfTitleLbl.TextColor3=Color3.fromRGB(110,110,110)
+	yrProfTitleLbl.TextSize=11; yrProfTitleLbl.Font=Enum.Font.GothamBold
+	yrProfTitleLbl.TextXAlignment=Enum.TextXAlignment.Left
+	yrProfTitleLbl.ZIndex=yrProfTitle.ZIndex+1; yrProfTitleLbl.Parent=yrProfTitle
+
+	-- Mode dropdown (Jitter / Spin)
+	local yrModeDrop, yrModeRefreshFn = addExploitDropdown(
+		exploitsContent, "Mode", {"Jitter","Spin"},
+		function() return yrActiveProfile().mode or "Jitter" end,
+		function(v) yrActiveProfile().mode = v end,
+		106
+	)
+	_yrModeRefresh = yrModeRefreshFn
+
+	-- Pitch dropdown
+	local yrPitchDrop, yrPitchRefreshFn = addExploitDropdown(
+		exploitsContent, "Pitch", {"Back","Forward","Right","Left","Custom"},
+		function() return yrActiveProfile().pitch or "Back" end,
+		function(v) yrActiveProfile().pitch = v end,
+		107
+	)
+	_yrPitchRefresh = yrPitchRefreshFn
+
+	-- Custom Pitch Angle slider
+	local _, yrCustomUpd = addExploitSlider(
+		exploitsContent, "Custom Pitch Angle",
+		function() return yrActiveProfile().pitchCustom or 180 end,
+		function(v) yrActiveProfile().pitchCustom = v end,
+		0, 360, 1, 108
+	)
+	_yrCustomSlidUpd = yrCustomUpd
+
+	-- Jitter toggle
+	local yrJitterTog = addToggle(exploitsContent, "Jitter", false, function(v)
+		yrActiveProfile().jitter = v
+	end)
+	yrJitterTog.LayoutOrder = 109
+	_yrJitterTog = yrJitterTog
+
+	-- Jitter Speed slider
+	local _, yrJitterSlidUpd = addExploitSlider(
+		exploitsContent, "Jitter Speed",
+		function() return yrActiveProfile().jitterSpeed or 10 end,
+		function(v) yrActiveProfile().jitterSpeed = v end,
+		1, 60, 1, 110
+	)
+	_yrJitterSlidUpd = yrJitterSlidUpd
+
+	-- Spin Speed slider
+	local _, yrSpinSlidUpd = addExploitSlider(
+		exploitsContent, "Spin Speed",
+		function() return yrActiveProfile().spinSpeed or 5 end,
+		function(v) yrActiveProfile().spinSpeed = v end,
+		1, 30, 1, 111
+	)
+	_yrSpinSlidUpd = yrSpinSlidUpd
+
+	-- ══════════════════════════════
+	-- YAW MANUAL секция
+	-- ══════════════════════════════
+	addExploitDiv(exploitsContent, 120)
+
+	local yrManualTitle = Instance.new("Frame")
+	yrManualTitle.Size=UDim2.new(1,-20,0,22); yrManualTitle.BackgroundTransparency=1
+	yrManualTitle.LayoutOrder=121; yrManualTitle.ZIndex=exploitsContent.ZIndex+1; yrManualTitle.Parent=exploitsContent
+	local yrManualTitleLbl = Instance.new("TextLabel")
+	yrManualTitleLbl.Size=UDim2.new(1,0,1,0); yrManualTitleLbl.Position=UDim2.fromOffset(16,0)
+	yrManualTitleLbl.BackgroundTransparency=1; yrManualTitleLbl.Text="YAW MANUAL"
+	yrManualTitleLbl.TextColor3=Color3.fromRGB(130,130,130)
+	yrManualTitleLbl.TextSize=12; yrManualTitleLbl.Font=Enum.Font.GothamBold
+	yrManualTitleLbl.TextXAlignment=Enum.TextXAlignment.Left
+	yrManualTitleLbl.ZIndex=yrManualTitle.ZIndex+1; yrManualTitleLbl.Parent=yrManualTitle
+
+	local yrManualToggle = addToggle(exploitsContent, "Manual", false, function(v)
+		YAW.manualEnabled = v
+		if not v then YAW.manualActive = false end
+	end)
+	yrManualToggle.LayoutOrder = 122
+
+	-- Left Key bind
+	addExploitKeybind(
+		exploitsContent, "Left Key",
+		function() return YAW.manualLeftKey end,
+		function(k) YAW.manualLeftKey = k end,
+		123
+	)
+
+	-- Right Key bind
+	addExploitKeybind(
+		exploitsContent, "Right Key",
+		function() return YAW.manualRightKey end,
+		function(k) YAW.manualRightKey = k end,
+		124
+	)
+
+	-- Manual Mode dropdown (Toggle / Hold / Always)
+	addExploitDropdown(
+		exploitsContent, "Manual Mode", {"Toggle","Hold","Always"},
+		function()
+			local m = YAW.manualMode or "toggle"
+			return m:sub(1,1):upper() .. m:sub(2)
+		end,
+		function(v)
+			YAW.manualMode = string.lower(v)
+			if YAW.manualMode == "always" then
+				YAW.manualActive = true
+			elseif YAW.manualMode ~= "toggle" then
+				YAW.manualActive = false
+			end
+		end,
+		125
+	)
+
+	addExploitDiv(exploitsContent, 130)
 
 	-- ── stats page ──
 	local statsContent = Instance.new("Frame")
@@ -2346,10 +3320,297 @@ local function createGui()
 	-- ── config page ──
 	local configPage = pages["config"]
 
+	-- ══ Реестр toggle-контейнеров для UI-синхронизации при load ══
+	-- Заполняется по именам Frame после создания всех toggles.
+	-- Ключ совпадает с ключом LOAD_STATE.
+	local TOGGLE_FRAMES = {
+		ab_enabled       = aimbotContent:FindFirstChild("AimbotToggle"),
+		ab_vischeck      = aimbotContent:FindFirstChild("Wall CheckToggle"),
+		ab_teamcheck     = aimbotContent:FindFirstChild("Team CheckToggle"),
+		ab_autoswitch    = aimbotContent:FindFirstChild("Auto SwitchToggle"),
+		ab_showfov       = aimbotContent:FindFirstChild("Show FOVToggle"),
+		ab_fovcheck      = aimbotContent:FindFirstChild("FOV CheckToggle"),
+		ab_autofire      = aimbotContent:FindFirstChild("Auto FireToggle"),
+		ab_backcamera    = aimbotContent:FindFirstChild("Back CameraToggle"),
+		vis_highlight    = visualContent:FindFirstChild("HighlightToggle"),
+		hs_enabled       = miscContent:FindFirstChild("HitsoundToggle"),
+		misc_tp_enabled  = miscContent:FindFirstChild("Third Person DistanceToggle"),
+		misc_fov_enabled = miscContent:FindFirstChild("Field Of ViewToggle"),
+		yaw_enabled      = exploitsContent:FindFirstChild("Yaw RotatorToggle"),
+		yaw_atTargets    = exploitsContent:FindFirstChild("At TargetsToggle"),
+		yaw_manualEnabled= exploitsContent:FindFirstChild("ManualToggle"),
+		yaw_jitter       = exploitsContent:FindFirstChild("JitterToggle"),
+		sprint_enabled   = exploitsContent:FindFirstChild("Auto SprintToggle"),
+	}
+
+	-- helper: синхронизировать визуал toggle с новым значением
+	local function syncToggleUI(key, val)
+		local frame = TOGGLE_FRAMES[key]
+		if frame and toggleState[frame] then
+			setToggleState(frame, val, false)
+		end
+	end
+
+	-- ══ Регистрация всех настроек для save/load ══
+	-- Aimbot
+	SAVE_STATE["ab_enabled"]        = function() return AB.enabled end
+	SAVE_STATE["ab_fov"]            = function() return AB.FOV end
+	SAVE_STATE["ab_smoothness"]     = function() return AB.Smoothness end
+	SAVE_STATE["ab_yoffset"]        = function() return AB.YOffset end
+	SAVE_STATE["ab_vischeck"]       = function() return AB.VisCheck end
+	SAVE_STATE["ab_teamcheck"]      = function() return AB.TeamCheck end
+	SAVE_STATE["ab_autoswitch"]     = function() return AB.AutoSwitch end
+	SAVE_STATE["ab_autofire"]       = function() return AB.AutoFire end
+	SAVE_STATE["ab_backcamera"]     = function() return AB.BackCamera end
+	SAVE_STATE["ab_bcd"]            = function() return AB.BackCameraDelay end
+	SAVE_STATE["ab_fovcheck"]       = function() return AB.FOVCheck end
+	SAVE_STATE["ab_showfov"]        = function() return AB_ShowFOV end
+	SAVE_STATE["ab_aimkey"]         = function() return enumToStr(AB.AimKey) end
+	SAVE_STATE["ab_targetparts"]    = function()
+		local t = {}
+		for k, v in pairs(AB.targetParts) do t[k] = v end
+		return t
+	end
+	-- Visual
+	SAVE_STATE["vis_highlight"]     = function() return highlightEnabled end
+	SAVE_STATE["vis_hl_color"]      = function() return colorToTbl(highlightColor) end
+	SAVE_STATE["vis_hl_alpha"]      = function() return highlightAlpha end
+	-- Hitsound
+	SAVE_STATE["hs_enabled"]        = function() return hsEnabled end
+	SAVE_STATE["hs_volume"]         = function() return hsVolume end
+	SAVE_STATE["hs_preset"]         = function() return hsPresetIdx end
+	SAVE_STATE["hs_custom_id"]      = function() return hsCustomId end
+	-- Misc: Field Of View
+	SAVE_STATE["misc_fov_enabled"]  = function() return fovEnabled end
+	SAVE_STATE["misc_fov_value"]    = function() return camFov end
+	-- Misc: Third Person
+	SAVE_STATE["misc_tp_enabled"]   = function() return tpEnabled end
+	SAVE_STATE["misc_tp_distance"]  = function() return tpDistance end
+	-- Yaw Rotator
+	SAVE_STATE["yaw_enabled"]       = function() return YAW.enabled end
+	SAVE_STATE["yaw_atTargets"]     = function() return YAW.atTargets end
+	SAVE_STATE["yaw_activeProfile"] = function() return YAW.activeProfile end
+	SAVE_STATE["yaw_profiles"]      = function()
+		local t = {}
+		for name, prof in pairs(YAW.profiles) do
+			t[name] = {
+				pitch       = prof.pitch,
+				pitchCustom = prof.pitchCustom,
+				mode        = prof.mode,
+				jitter      = prof.jitter,
+				jitterSpeed = prof.jitterSpeed,
+				spinSpeed   = prof.spinSpeed,
+			}
+		end
+		return t
+	end
+	SAVE_STATE["sprint_enabled"]     = function() return sprintEnabled end
+	SAVE_STATE["yaw_jitter"]         = function() return yrActiveProfile().jitter or false end
+	SAVE_STATE["yaw_manualEnabled"]  = function() return YAW.manualEnabled end
+	SAVE_STATE["yaw_manualMode"]     = function() return YAW.manualMode end
+	SAVE_STATE["yaw_manualLeftKey"]  = function()
+		return tostring(YAW.manualLeftKey):gsub("Enum%.KeyCode%.", "")
+	end
+	SAVE_STATE["yaw_manualRightKey"] = function()
+		return tostring(YAW.manualRightKey):gsub("Enum%.KeyCode%.", "")
+	end
+
+	-- ══ Setters для load (применяют значения в рантайм + обновляют UI) ══
+	local LOAD_STATE = {}
+	LOAD_STATE["ab_enabled"]        = function(v) AB.enabled = v==true; syncToggleUI("ab_enabled", v==true) end
+	LOAD_STATE["ab_fov"]            = function(v) if type(v)=="number" then AB.FOV = v; if fovCircle then fovCircle.Radius = v end end end
+	LOAD_STATE["ab_smoothness"]     = function(v) if type(v)=="number" then AB.Smoothness = v end end
+	LOAD_STATE["ab_yoffset"]        = function(v) if type(v)=="number" then AB.YOffset = v end end
+	LOAD_STATE["ab_vischeck"]       = function(v) AB.VisCheck = v==true; syncToggleUI("ab_vischeck", v==true) end
+	LOAD_STATE["ab_teamcheck"]      = function(v) AB.TeamCheck = v==true; syncToggleUI("ab_teamcheck", v==true) end
+	LOAD_STATE["ab_autoswitch"]     = function(v) AB.AutoSwitch = v==true; syncToggleUI("ab_autoswitch", v==true) end
+	LOAD_STATE["ab_autofire"]       = function(v) AB.AutoFire = v==true; syncToggleUI("ab_autofire", v==true) end
+	LOAD_STATE["ab_backcamera"]     = function(v) AB.BackCamera = v==true; syncToggleUI("ab_backcamera", v==true) end
+	LOAD_STATE["ab_bcd"]            = function(v) if type(v)=="number" then AB.BackCameraDelay = v end end
+	LOAD_STATE["ab_fovcheck"]       = function(v) AB.FOVCheck = v==true; syncToggleUI("ab_fovcheck", v==true) end
+	LOAD_STATE["ab_showfov"]        = function(v) AB_ShowFOV = v==true; syncToggleUI("ab_showfov", v==true) end
+	LOAD_STATE["ab_aimkey"]         = function(v) if type(v)=="string" then AB.AimKey = strToAimKey(v) end end
+	LOAD_STATE["ab_targetparts"]    = function(v) if type(v)=="table" then for k,b in pairs(v) do AB.targetParts[k] = b end end end
+	LOAD_STATE["vis_highlight"]     = function(v)
+		highlightEnabled = v==true
+		syncToggleUI("vis_highlight", v==true)
+		setHighlightEnabled(highlightEnabled)
+	end
+	LOAD_STATE["vis_hl_color"]      = function(v) local c = tblToColor(v); if c then highlightColor = c; refreshHighlightColors() end end
+	LOAD_STATE["vis_hl_alpha"]      = function(v) if type(v)=="number" then highlightAlpha = v; refreshHighlightColors() end end
+	LOAD_STATE["hs_enabled"]        = function(v) hsEnabled = v==true; syncToggleUI("hs_enabled", v==true) end
+	LOAD_STATE["hs_volume"]         = function(v) if type(v)=="number" then hsVolume = v; if hsSound then pcall(function() hsSound.Volume = v/100 end) end end end
+	LOAD_STATE["hs_preset"]         = function(v) if type(v)=="number" then hsPresetIdx = v; createHsSound() end end
+	LOAD_STATE["hs_custom_id"]      = function(v) if type(v)=="string" then hsCustomId = v end end
+	-- Misc: Field Of View
+	LOAD_STATE["misc_fov_enabled"]  = function(v)
+		fovEnabled = v==true
+		syncToggleUI("misc_fov_enabled", v==true)
+	end
+	LOAD_STATE["misc_fov_value"]    = function(v)
+		if type(v)=="number" then camFov = math.clamp(v, 30, 120) end
+	end
+	-- Misc: Third Person
+	LOAD_STATE["misc_tp_enabled"]   = function(v)
+		tpEnabled = v==true
+		syncToggleUI("misc_tp_enabled", v==true)
+		if tpEnabled then applyThirdPerson() end
+	end
+	LOAD_STATE["misc_tp_distance"]  = function(v)
+		if type(v)=="number" then tpDistance = math.clamp(v, 4, 60) end
+	end
+	-- Yaw Rotator
+	LOAD_STATE["yaw_enabled"]       = function(v)
+		YAW.enabled = v==true
+		syncToggleUI("yaw_enabled", v==true)
+		if v==true then startYawRotator() else stopYawRotator() end
+	end
+	LOAD_STATE["yaw_atTargets"]     = function(v)
+		YAW.atTargets = v==true
+		syncToggleUI("yaw_atTargets", v==true)
+	end
+	LOAD_STATE["yaw_activeProfile"] = function(v)
+		if type(v)=="string" and YAW.profiles[v] then
+			YAW.activeProfile = v
+			yrLoadProfileUI()
+		end
+	end
+	LOAD_STATE["yaw_profiles"]      = function(v)
+		if type(v)~="table" then return end
+		for name, prof in pairs(v) do
+			if type(prof)=="table" and YAW.profiles[name] then
+				local p = YAW.profiles[name]
+				if prof.pitch       ~= nil then p.pitch       = prof.pitch       end
+				if prof.pitchCustom ~= nil then p.pitchCustom = prof.pitchCustom end
+				if prof.mode        ~= nil then p.mode        = prof.mode        end
+				if prof.jitter      ~= nil then p.jitter      = prof.jitter      end
+				if prof.jitterSpeed ~= nil then p.jitterSpeed = prof.jitterSpeed end
+				if prof.spinSpeed   ~= nil then p.spinSpeed   = prof.spinSpeed   end
+			end
+		end
+		yrLoadProfileUI()
+	end
+	LOAD_STATE["yaw_manualEnabled"] = function(v)
+		YAW.manualEnabled = v==true
+		syncToggleUI("yaw_manualEnabled", v==true)
+		if not v then YAW.manualActive = false end
+	end
+	LOAD_STATE["yaw_manualMode"]    = function(v)
+		if type(v)=="string" then YAW.manualMode = v end
+	end
+	LOAD_STATE["yaw_manualLeftKey"] = function(v)
+		if type(v)=="string" then
+			pcall(function() YAW.manualLeftKey = Enum.KeyCode[v] end)
+		end
+	end
+	LOAD_STATE["yaw_manualRightKey"] = function(v)
+		if type(v)=="string" then
+			pcall(function() YAW.manualRightKey = Enum.KeyCode[v] end)
+		end
+	end
+	LOAD_STATE["yaw_jitter"]        = function(v)
+		yrActiveProfile().jitter = v==true
+		syncToggleUI("yaw_jitter", v==true)
+	end
+	LOAD_STATE["sprint_enabled"]    = function(v)
+		sprintEnabled = v==true
+		syncToggleUI("sprint_enabled", v==true)
+		if v==true then startSprint() end
+	end
+
+	local function doSave()
+		if not cfgWriteAvailable() then return false end
+		cfgEnsureFolder()
+		local ok = pcall(function()
+			local t = {}
+			for k, getter in pairs(SAVE_STATE) do
+				pcall(function() t[k] = getter() end)
+			end
+			writefile(CONFIG_FILE, HttpService:JSONEncode(t))
+		end)
+		return ok
+	end
+
+	local function doLoad()
+		if not cfgWriteAvailable() then return false end
+		local hasFile = true
+		if type(isfile) == "function" then hasFile = isfile(CONFIG_FILE) end
+		if not hasFile then return false end
+		local ok = pcall(function()
+			local raw = readfile(CONFIG_FILE)
+			local t = HttpService:JSONDecode(raw)
+			for k, setter in pairs(LOAD_STATE) do
+				if t[k] ~= nil then
+					pcall(setter, t[k])
+				end
+			end
+		end)
+		return ok
+	end
+
+	-- Автозагрузка при старте перенесена в конец createGui(),
+	-- после инициализации TOGGLE_FRAMES, чтобы syncToggleUI работал корректно.
+
+	-- ── Кнопки Save / Load в config page ──
+	local cfgY = 10
+
+	local function makeCfgBtn(label, yPos, onClick)
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.fromOffset(100, 26)
+		btn.Position = UDim2.fromOffset(10, yPos)
+		btn.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+		btn.BorderSizePixel = 0
+		btn.Text = label
+		btn.TextColor3 = Color3.fromRGB(210, 210, 210)
+		btn.TextSize = 14
+		btn.Font = Enum.Font.SourceSans
+		btn.AutoButtonColor = false
+		btn.ZIndex = 80
+		btn.Parent = configPage
+		local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0,4); bc.Parent = btn
+		local bs = Instance.new("UIStroke"); bs.Thickness = 1; bs.Color = Color3.fromRGB(50,50,50); bs.Parent = btn
+		local function flash(success)
+			local col = success and Color3.fromRGB(60,100,60) or Color3.fromRGB(100,50,50)
+			btn.BackgroundColor3 = col
+			task.delay(0.6, function()
+				TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(28,28,28)}):Play()
+			end)
+		end
+		track(btn.MouseButton1Click:Connect(function()
+			local ok = onClick()
+			flash(ok)
+		end))
+		return btn
+	end
+
+	makeCfgBtn("Save Config", cfgY,      function() return doSave() end)
+	makeCfgBtn("Load Config", cfgY + 34, function() return doLoad() end)
+
+	-- Статус (показывает PlaceId и путь файла)
+	local cfgInfo = Instance.new("TextLabel")
+	cfgInfo.Size = UDim2.new(1, -16, 0, 40)
+	cfgInfo.Position = UDim2.fromOffset(10, cfgY + 72)
+	cfgInfo.BackgroundTransparency = 1
+	cfgInfo.Text = "Place: " .. tostring(game.PlaceId) .. "\nFile: " .. CONFIG_FILE
+	cfgInfo.TextColor3 = Color3.fromRGB(100, 100, 100)
+	cfgInfo.TextSize = 11
+	cfgInfo.Font = Enum.Font.SourceSans
+	cfgInfo.TextXAlignment = Enum.TextXAlignment.Left
+	cfgInfo.TextWrapped = true
+	cfgInfo.ZIndex = 80
+	cfgInfo.Parent = configPage
+
+	-- Разделитель
+	local cfgDiv = Instance.new("Frame")
+	cfgDiv.Size = UDim2.new(1, -20, 0, 1)
+	cfgDiv.Position = UDim2.fromOffset(10, cfgY + 118)
+	cfgDiv.BackgroundColor3 = Color3.fromRGB(45,45,45)
+	cfgDiv.BorderSizePixel = 0; cfgDiv.ZIndex = 80; cfgDiv.Parent = configPage
+
 	local unloadBtn = Instance.new("TextButton")
 	unloadBtn.Name = "Unload"
 	unloadBtn.AnchorPoint = Vector2.new(0, 0)
-	unloadBtn.Position = UDim2.fromOffset(10, 10)
+	unloadBtn.Position = UDim2.fromOffset(10, cfgY + 128)
 	unloadBtn.Size = UDim2.fromOffset(80, 24)
 	unloadBtn.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
 	unloadBtn.BorderSizePixel = 0
@@ -2408,6 +3669,11 @@ local function createGui()
 
 	switchTab("aimbot")
 
+	-- Автозагрузка конфига — вызывается ЗДЕСЬ, когда TOGGLE_FRAMES уже
+	-- инициализирован и все UI-элементы созданы. Иначе syncToggleUI не
+	-- находит фреймы и цвета включённых toggles не обновляются.
+	task.defer(function() pcall(doLoad) end)
+
 	screenGui = sg
 	return sg
 end
@@ -2423,6 +3689,7 @@ createGui()
 setOpen(false)
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if isUnloaded then return end
 	if gameProcessed then return end
 	if input.KeyCode == TOGGLE_KEY then
 		setOpen(not isOpen)
